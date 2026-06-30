@@ -263,9 +263,28 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
     # exec_id → asyncio.Event + result dict（用于等待手机确认回复）
     pending: dict[str, tuple[asyncio.Event, dict]] = {}
 
-    print(f"🔌  Connecting to {backend_url} ...")
-
-    async for ws in websockets.connect(uri, ping_interval=25, ping_timeout=15):
+    while True:
+        print(f"🔌  Connecting to {backend_url} ...")
+        try:
+            ws = await websockets.connect(uri, ping_interval=25, ping_timeout=15)
+        except websockets.InvalidStatus as e:
+            # 升级前被 HTTP 拒(非 101)。401/403/429 = 认证/权限/限流死路:token 失效、被吊销、
+            # 地区禁用、或 auth-fail 触发限流(后端 body 附 action:reauth)。这类「重连也没用」——
+            # 干净退出(exit 0),靠 plist KeepAlive.SuccessfulExit=false 让 launchd 不再拉起,
+            # 终止死循环刷 429。恢复:重新 --pair 后 launchctl load。
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in (401, 403, 429):
+                print(f"❌  服务端拒绝连接 (HTTP {code}) —— token 失效 / 被吊销 / 被限流,重连无效。")
+                print(f"    请重新配对后再启动:python3 keni_agent.py --pair <新6位码> --backend {backend_url}")
+                print("    已停止自动重连(干净退出,launchd 不再拉起)。")
+                sys.exit(0)
+            print(f"⚠️  服务端拒绝 (HTTP {code}),30s 后重试...")
+            await asyncio.sleep(30)
+            continue
+        except (OSError, asyncio.TimeoutError) as e:
+            print(f"⚠️  连接失败 ({e}),5s 后重连...")
+            await asyncio.sleep(5)
+            continue
         try:
             print(f"✅  Agent '{device_name}' connected!")
 
@@ -315,6 +334,11 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
         except websockets.ConnectionClosed:
             print("⚠️  Connection closed, reconnecting in 5s...")
             await asyncio.sleep(5)
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
 
 async def handle_exec(ws, msg: dict, pending: dict, default_dir: str):
