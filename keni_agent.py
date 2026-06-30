@@ -34,6 +34,14 @@ except ImportError:
     subprocess.run([sys.executable, "-m", "pip", "install", "websockets"], check=True)
     import websockets
 
+# ── 重连 / 心跳参数(可经环境变量外置覆盖,免改码调优)────────────────
+# 瞬时失败(网络抖动 / backend 重启 / 临时拒绝)指数退避重连:base 起步、×2 增长、封顶 max,
+# 连上后重置 base。避免之前那种固定间隔在长时间断网时的无效高频重连。
+RECONNECT_BASE = float(os.environ.get("KENI_RECONNECT_BASE", "2"))   # 首次退避秒数
+RECONNECT_MAX = float(os.environ.get("KENI_RECONNECT_MAX", "60"))    # 退避上限秒数
+PING_INTERVAL = float(os.environ.get("KENI_PING_INTERVAL", "25"))    # ws 心跳间隔
+PING_TIMEOUT = float(os.environ.get("KENI_PING_TIMEOUT", "15"))      # ws 心跳超时
+
 # ── 白名单 ─────────────────────────────────────────────────
 
 # 无需确认：只读 / 分析类
@@ -263,10 +271,11 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
     # exec_id → asyncio.Event + result dict（用于等待手机确认回复）
     pending: dict[str, tuple[asyncio.Event, dict]] = {}
 
+    backoff = RECONNECT_BASE  # 瞬时失败指数退避,连上即重置
     while True:
         print(f"🔌  Connecting to {backend_url} ...")
         try:
-            ws = await websockets.connect(uri, ping_interval=25, ping_timeout=15)
+            ws = await websockets.connect(uri, ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT)
         except websockets.InvalidStatus as e:
             # 升级前被 HTTP 拒(非 101)。401/403/429 = 认证/权限/限流死路:token 失效、被吊销、
             # 地区禁用、或 auth-fail 触发限流(后端 body 附 action:reauth)。这类「重连也没用」——
@@ -278,13 +287,16 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
                 print(f"    请重新配对后再启动:python3 keni_agent.py --pair <新6位码> --backend {backend_url}")
                 print("    已停止自动重连(干净退出,launchd 不再拉起)。")
                 sys.exit(0)
-            print(f"⚠️  服务端拒绝 (HTTP {code}),30s 后重试...")
-            await asyncio.sleep(30)
+            print(f"⚠️  服务端拒绝 (HTTP {code}),{backoff:.0f}s 后重试...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_MAX)
             continue
         except (OSError, asyncio.TimeoutError) as e:
-            print(f"⚠️  连接失败 ({e}),5s 后重连...")
-            await asyncio.sleep(5)
+            print(f"⚠️  连接失败 ({e}),{backoff:.0f}s 后重连...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_MAX)
             continue
+        backoff = RECONNECT_BASE  # 连上了 → 重置退避
         try:
             print(f"✅  Agent '{device_name}' connected!")
 
@@ -332,8 +344,9 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
                         print(f"⚠️   Kill: exec_id={target_exec} not found")
 
         except websockets.ConnectionClosed:
-            print("⚠️  Connection closed, reconnecting in 5s...")
-            await asyncio.sleep(5)
+            print(f"⚠️  Connection closed, reconnecting in {backoff:.0f}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_MAX)
         finally:
             try:
                 await ws.close()
