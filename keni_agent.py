@@ -208,14 +208,21 @@ async def execute(ws, exec_id: str, cmd_type: str, instruction: str, working_dir
     await broadcast_sessions(ws)
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
+        proc_kwargs = dict(
             stdin=asyncio.subprocess.PIPE if use_stdin else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=working_dir,
             env={**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1"},
         )
+        if cmd_type in PROVIDERS:
+            # NL provider(claude_code 等):provider build 已构好 argv,直执行。
+            proc = await asyncio.create_subprocess_exec(*cmd, **proc_kwargs)
+        else:
+            # shell 模式:走 /bin/sh -c,让 && | > ; 等 shell 操作符生效。此前 shlex.split +
+            # exec 把 `a && b` 拆成 argv 传给首程序(sw_vers 收到 -a 报错 / 标签当程序找不到)。
+            # 安全边界不变:仍受后端 allow_shell 闸 + 危险命令黑名单 + 用户确认三重约束。
+            proc = await asyncio.create_subprocess_shell(instruction, **proc_kwargs)
         sess.proc = proc
 
         if use_stdin and proc.stdin is not None:
@@ -383,7 +390,9 @@ async def handle_exec(ws, msg: dict, pending: dict, default_dir: str):
             "agent_id":    agent_id,
             "cmd_type":    cmd_type,
             "instruction": instruction,
-            "prompt":      f"将要执行:\n{instruction}",
+            # 手机端弹窗自带「将要在 Mac 上执行以下指令」标题 → prompt 只放裸指令,不再前缀
+            # 「将要执行:」(避免弹窗里重复)。Mac 原生弹窗(下方)是独立语境,保留前缀。
+            "prompt":      instruction,
         }, ensure_ascii=False))
 
         # 2. 同时在 Mac 弹窗（asyncio 线程池执行阻塞调用）
