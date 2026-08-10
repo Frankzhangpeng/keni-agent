@@ -4,9 +4,9 @@
 
 ## 它能干什么
 
-- **NL → 代码操作**:手机说"帮我用 claude review 一下当前 PR",Mac 上自动跑 `claude --print` 并把结果流回手机
+- **NL → 代码操作**:服务端安全开关启用对应 provider 后，手机可下发代码任务，Mac 上运行 CLI 并把结果流回手机
 - **多 LLM CLI 即插即用**:Claude / OpenClaw / Codex / Cursor 任选,APP 远控屏下拉切换
-- **安全闸**:破坏性命令(`rm` / `git push` / 任意 NL 提示)必须 macOS 弹窗 + 手机确认才执行;`sudo` / `bash` 直接禁止
+- **安全闸**:破坏性命令(`rm` / `git push` / 任意 NL 提示)同时发起 Mac 与手机确认，任一端明确允许即可执行；`sudo` / `bash` 直接禁止
 - **多会话并发**:手机可以同时跑多条命令,逐条 kill
 - **Soul Memory 注入**:NL 命令自动带上后端记忆("按我平时的习惯整理…"这种指代能理解)
 
@@ -63,11 +63,12 @@ token 第一次配对后缓存在 `~/.superapp_agent.json`,后续直接跑就行
 | `codex`      | `codex exec <prompt>`             | 视上游而定                              |
 | `cursor`     | `cursor-agent --prompt <prompt>`  | 视上游而定                              |
 
-没装的 provider 在手机端会回 `命令未找到`,装上即用,不必改 agent 代码。
+没装的 provider 在手机端会回 `命令未找到`。装好 CLI 后还需部署侧显式开启
+对应 NL provider 安全闸；默认关闭时不会把自然语言误当 Shell 执行。
 
 加新 provider 改 `keni_agent.py` 的 `PROVIDERS` dict 即可。同步要改两个 super 仓库文件:
-- `backend/handlers/actions.go` 的 `execOpenRemoteControl` 白名单
-- `backend/handlers/agent.go` 的 `RouteAgentExec` NL 白名单
+- `backend/handlers/agent_exec.go` 的 `RouteAgentExec` 白名单
+- `flutter_app/lib/screens/remote_control/rc_cmd_type.dart` 的 provider 定义
 
 super 仓库的 CI(`.github/workflows/check-agent-providers.yml`)会校验三处白名单一致。
 
@@ -76,7 +77,7 @@ super 仓库的 CI(`.github/workflows/check-agent-providers.yml`)会校验三处
 | 命令类别       | 行为                                     |
 | -------------- | ---------------------------------------- |
 | safe(只读)   | 直接执行(`ls/cat/grep/git status...`) |
-| confirm        | 双弹窗:Mac AppleScript + 手机 WS,任一拒绝就 abort |
+| confirm        | Mac AppleScript + 手机 WS 并行确认，任一端允许即继续；双方拒绝或超时 abort |
 | banned         | 客户端不可触达(`sudo/su/bash/sh/zsh/nc`) |
 | NL provider    | 永远 confirm —— LLM 输出不可预测       |
 

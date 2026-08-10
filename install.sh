@@ -42,10 +42,8 @@ echo "📦  pip install -r requirements.txt ..."
 
 # 配对(可选)—— 先跑一次 keni_agent.py --pair 把 token 缓存到 ~/.superapp_agent.json
 if [[ -n "$PAIR" ]]; then
-  echo "🔑  使用配对码 $PAIR 换 token..."
-  "$PY" "$REPO_DIR/keni_agent.py" --pair "$PAIR" --backend "$BACKEND" --token "" 2>&1 | head -5 || true
-  # --token "" 走的还是 pair 分支,但显式传空避免 argparse 误用历史 token
-  # 真实兜底:redeem 失败 keni_agent.py 自己 sys.exit(1),这里 || true 让 install 继续
+  echo "🔑  正在使用一次性配对码换 token..."
+  "$PY" "$REPO_DIR/keni_agent.py" --pair "$PAIR" --pair-only --backend "$BACKEND"
 fi
 
 # 写 LaunchAgent plist —— 用 sed 把模板里的 {{ }} 替换掉

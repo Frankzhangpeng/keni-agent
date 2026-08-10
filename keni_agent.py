@@ -41,6 +41,8 @@ RECONNECT_BASE = float(os.environ.get("KENI_RECONNECT_BASE", "2"))   # 首次退
 RECONNECT_MAX = float(os.environ.get("KENI_RECONNECT_MAX", "60"))    # 退避上限秒数
 PING_INTERVAL = float(os.environ.get("KENI_PING_INTERVAL", "25"))    # ws 心跳间隔
 PING_TIMEOUT = float(os.environ.get("KENI_PING_TIMEOUT", "15"))      # ws 心跳超时
+EXEC_PROGRESS_INTERVAL = float(os.environ.get("KENI_EXEC_PROGRESS_INTERVAL", "15"))
+MAX_ACTIVE_SESSIONS = 3
 
 # ── 白名单 ─────────────────────────────────────────────────
 
@@ -129,17 +131,81 @@ def classify(cmd_type: str, instruction: str) -> str:
 
 # ── macOS 原生确认弹窗 ──────────────────────────────────────
 
-def macos_dialog(title: str, message: str) -> bool:
-    escaped = message.replace('"', '\\"')
-    script = (
-        f'display dialog "{escaped}" '
-        f'buttons {{"拒绝", "允许"}} '
-        f'default button "允许" '
-        f'with icon caution '
-        f'with title "{title}"'
+MACOS_DIALOG_SCRIPT = """
+on run argv
+  display dialog (item 2 of argv) buttons {"拒绝", "允许"} default button "允许" with icon caution with title (item 1 of argv) giving up after 60
+end run
+"""
+
+
+def dialog_approved(stdout: str, returncode: int) -> bool:
+    return (
+        returncode == 0
+        and "button returned:允许" in stdout
+        and "gave up:false" in stdout
     )
-    r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    return "允许" in r.stdout
+
+def macos_dialog(title: str, message: str) -> bool:
+    # 远程文本绝不能拼进 AppleScript 源码。通过 argv 传值后，反斜杠、引号、
+    # 换行和 `do shell script` 都只会成为对话框字面量。
+    r = subprocess.run(
+        ["osascript", "-e", MACOS_DIALOG_SCRIPT, "--", title, message],
+        capture_output=True,
+        text=True,
+    )
+    return dialog_approved(r.stdout, r.returncode)
+
+
+async def macos_dialog_async(title: str, message: str) -> bool:
+    """可取消的生产路径；手机先决议时主动关闭仍显示在 Mac 上的旧弹窗。"""
+    proc = await asyncio.create_subprocess_exec(
+        "osascript", "-e", MACOS_DIALOG_SCRIPT, "--", title, message,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        raise
+    return dialog_approved(stdout.decode("utf-8", errors="replace"), proc.returncode)
+
+
+async def wait_for_confirmation(mac_future, event, result, timeout=60) -> bool:
+    """Mac 与手机真正竞争；任一明确允许即继续，超时/双方拒绝均 fail closed。"""
+    phone_task = asyncio.create_task(event.wait())
+    waiting = {mac_future, phone_task}
+    deadline = asyncio.get_running_loop().time() + timeout
+    try:
+        while waiting:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False
+            done, _ = await asyncio.wait(
+                waiting, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                return False
+            if mac_future in done:
+                waiting.remove(mac_future)
+                if mac_future.result() is True:
+                    return True
+            if phone_task in done:
+                waiting.remove(phone_task)
+                if result.get("approved") is True:
+                    return True
+        return False
+    finally:
+        phone_task.cancel()
+        if not mac_future.done():
+            mac_future.cancel()
+        await asyncio.gather(phone_task, mac_future, return_exceptions=True)
 
 
 # ── 命令执行（流式输出）─────────────────────────────────────
@@ -150,7 +216,7 @@ import time as _time  # 避免和上面 import 顺序冲突
 
 
 class SessionInfo:
-    __slots__ = ("exec_id", "cmd_type", "instruction", "started_at", "proc")
+    __slots__ = ("exec_id", "cmd_type", "instruction", "started_at", "proc", "pgid", "killed")
 
     def __init__(self, exec_id, cmd_type, instruction):
         self.exec_id    = exec_id
@@ -158,9 +224,31 @@ class SessionInfo:
         self.instruction = instruction
         self.started_at = _time.time()
         self.proc       = None  # 子进程实例（asyncio.subprocess.Process）
+        self.pgid       = None
+        self.killed     = False
 
 
 ACTIVE_SESSIONS: dict[str, SessionInfo] = {}
+# reservation 覆盖“等待 Mac/手机确认”与“已启动进程”两个阶段，避免跨 Pod
+# 后端转发时把 3 并发保护绕成无限确认弹窗。所有变更都在 asyncio 事件循环内，
+# check + add 之间没有 await，因而不需要额外锁。
+EXEC_RESERVATIONS: set[str] = set()
+
+
+def reserve_exec(exec_id: str) -> bool:
+    if not exec_id or exec_id in EXEC_RESERVATIONS:
+        return False
+    if len(EXEC_RESERVATIONS) >= MAX_ACTIVE_SESSIONS:
+        return False
+    EXEC_RESERVATIONS.add(exec_id)
+    return True
+
+
+def local_reservation_key(exec_id: str) -> str:
+    # 老协议允许空 exec_id；只给本机并发记账生成私有 key，不改变线上帧。
+    if exec_id:
+        return exec_id
+    return f"legacy:{id(asyncio.current_task())}:{_time.time_ns()}"
 
 # 由 agent_registered 帧从 backend 拿到；上报会话时附在帧里，方便手机端归属
 SELF_AGENT_ID: str = ""
@@ -187,7 +275,73 @@ async def broadcast_sessions(ws):
         pass
 
 
-async def execute(ws, exec_id: str, cmd_type: str, instruction: str, working_dir: str):
+async def progress_heartbeat(ws, exec_id: str):
+    """可选协议帧；老 backend 会忽略，新手机据此保持长任务为 active。"""
+    while True:
+        await asyncio.sleep(EXEC_PROGRESS_INTERVAL)
+        sess = ACTIVE_SESSIONS.get(exec_id)
+        if sess is None:
+            return
+        await ws.send(json.dumps({
+            "type": "agent_exec_progress",
+            "exec_id": exec_id,
+            "started_at": int(sess.started_at),
+        }))
+
+
+def terminate_process_tree(proc, pgid=None) -> bool:
+    """终止整个进程组，避免 shell/CLI 的子孙进程留在电脑后台。"""
+    if proc is None and pgid is None:
+        return False
+    try:
+        if os.name == "posix":
+            target = pgid if pgid is not None else os.getpgid(proc.pid)
+            os.killpg(target, signal.SIGTERM)
+        else:
+            if proc.returncode is not None:
+                return False
+            proc.terminate()
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+async def reap_process_tree(proc, pgid=None, grace: float = 5.0):
+    if proc is None and pgid is None:
+        return
+    if os.name == "posix" and pgid is None and proc is not None:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            pgid = None
+    terminate_process_tree(proc, pgid)
+    deadline = asyncio.get_running_loop().time() + grace
+    if proc is not None and proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace)
+        except asyncio.TimeoutError:
+            pass
+    if os.name == "posix" and pgid is not None:
+        # leader 可能先退出；继续探测保存下来的 pgid，宽限后杀仍忽略 TERM 的子孙。
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, OSError):
+                return
+            await asyncio.sleep(0.05)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+    elif proc is not None and proc.returncode is None:
+        proc.kill()
+        await proc.wait()
+
+
+async def execute(
+    ws, exec_id: str, cmd_type: str, instruction: str, working_dir: str,
+    *, reservation_held: bool = False,
+):
     use_stdin = False
     try:
         if cmd_type in PROVIDERS:
@@ -203,10 +357,24 @@ async def execute(ws, exec_id: str, cmd_type: str, instruction: str, working_dir
     if not os.path.isdir(working_dir):
         working_dir = os.path.expanduser("~")
 
+    acquired_here = False
+    reservation_key = exec_id
+    if not reservation_held:
+        reservation_key = local_reservation_key(exec_id)
+    if not reservation_held and not reserve_exec(reservation_key):
+        await send_output(
+            ws, exec_id, "并发任务过多，请等待已有任务结束\n",
+            done=True, exit_code=75, error="too_many_inflight",
+        )
+        return
+    if not reservation_held:
+        acquired_here = True
+
     sess = SessionInfo(exec_id, cmd_type, instruction)
     ACTIVE_SESSIONS[exec_id] = sess
     await broadcast_sessions(ws)
 
+    progress_task = None
     try:
         proc_kwargs = dict(
             stdin=asyncio.subprocess.PIPE if use_stdin else None,
@@ -214,6 +382,7 @@ async def execute(ws, exec_id: str, cmd_type: str, instruction: str, working_dir
             stderr=asyncio.subprocess.STDOUT,
             cwd=working_dir,
             env={**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1"},
+            start_new_session=(os.name == "posix"),
         )
         if cmd_type in PROVIDERS:
             # NL provider(claude_code 等):provider build 已构好 argv,直执行。
@@ -224,6 +393,9 @@ async def execute(ws, exec_id: str, cmd_type: str, instruction: str, working_dir
             # 安全边界不变:仍受后端 allow_shell 闸 + 危险命令黑名单 + 用户确认三重约束。
             proc = await asyncio.create_subprocess_shell(instruction, **proc_kwargs)
         sess.proc = proc
+        if os.name == "posix":
+            sess.pgid = os.getpgid(proc.pid)
+        progress_task = asyncio.create_task(progress_heartbeat(ws, exec_id))
 
         if use_stdin and proc.stdin is not None:
             try:
@@ -240,34 +412,61 @@ async def execute(ws, exec_id: str, cmd_type: str, instruction: str, working_dir
             await send_output(ws, exec_id, chunk.decode("utf-8", errors="replace"), done=False)
 
         exit_code = await proc.wait()
-        await send_output(ws, exec_id, "", done=True, exit_code=exit_code)
+        await send_output(
+            ws,
+            exec_id,
+            "",
+            done=True,
+            exit_code=exit_code,
+            error="killed" if sess.killed else None,
+        )
 
+    except asyncio.CancelledError:
+        # backend 当前会把 agent 断连的 session 立即标 cancelled。兼容该语义：
+        # 不在旧连接上幽灵续跑，也不自动换 exec_id 重放非幂等命令。
+        await reap_process_tree(sess.proc, sess.pgid)
+        raise
     except FileNotFoundError:
         cmd_name = cmd[0] if cmd else instruction
         await send_output(ws, exec_id, f"命令未找到: {cmd_name}\n", done=True, exit_code=127)
     except Exception as e:
-        await send_output(ws, exec_id, f"执行错误: {e}\n", done=True, exit_code=1)
+        # 传输失败也必须先收进程树；不能再向同一个坏 ws 发送失败信息后丢掉句柄。
+        await reap_process_tree(sess.proc, sess.pgid)
+        try:
+            await send_output(ws, exec_id, f"执行错误: {e}\n", done=True, exit_code=1)
+        except Exception:
+            pass
     finally:
+        if progress_task is not None:
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
         ACTIVE_SESSIONS.pop(exec_id, None)
+        if acquired_here:
+            EXEC_RESERVATIONS.discard(reservation_key)
         await broadcast_sessions(ws)
 
 
-def kill_session(exec_id: str) -> bool:
+async def kill_session(exec_id: str) -> bool:
     """手机端请求 kill 指定 exec_id。返回是否找到并 terminate。"""
     sess = ACTIVE_SESSIONS.get(exec_id)
     if not sess or not sess.proc:
         return False
     try:
-        sess.proc.terminate()
+        sess.killed = True
+        await reap_process_tree(sess.proc, sess.pgid)
         return True
     except Exception:
         return False
 
 
-async def send_output(ws, exec_id: str, output: str, *, done: bool, exit_code: int = 0):
+async def send_output(
+    ws, exec_id: str, output: str, *, done: bool, exit_code: int = 0, error=None
+):
     msg: dict = {"type": "agent_output", "exec_id": exec_id, "output": output, "done": done}
     if done:
         msg["exit_code"] = exit_code
+    if error:
+        msg["error"] = error
     await ws.send(json.dumps(msg, ensure_ascii=False))
 
 
@@ -281,6 +480,7 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
     backoff = RECONNECT_BASE  # 瞬时失败指数退避,连上即重置
     while True:
         print(f"🔌  Connecting to {backend_url} ...")
+        reconnect_with_backoff = False
         try:
             ws = await websockets.connect(uri, ping_interval=PING_INTERVAL, ping_timeout=PING_TIMEOUT)
         except websockets.InvalidStatus as e:
@@ -304,6 +504,7 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
             backoff = min(backoff * 2, RECONNECT_MAX)
             continue
         backoff = RECONNECT_BASE  # 连上了 → 重置退避
+        connection_tasks: set[asyncio.Task] = set()
         try:
             print(f"✅  Agent '{device_name}' connected!")
 
@@ -328,7 +529,11 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
 
                 # ── 执行命令 ────────────────────────────────
                 elif t == "agent_exec":
-                    asyncio.create_task(handle_exec(ws, msg, pending, default_dir))
+                    task = asyncio.create_task(
+                        handle_exec(ws, msg, pending, default_dir)
+                    )
+                    connection_tasks.add(task)
+                    task.add_done_callback(connection_tasks.discard)
 
                 # ── 手机确认回复 ─────────────────────────────
                 elif t == "agent_confirm_response":
@@ -345,20 +550,29 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
                 # ── 杀掉指定会话 ─────────────────────────────
                 elif t == "agent_kill_exec":
                     target_exec = msg.get("exec_id", "")
-                    if kill_session(target_exec):
+                    if await kill_session(target_exec):
                         print(f"🔪  Killed exec_id={target_exec}")
                     else:
                         print(f"⚠️   Kill: exec_id={target_exec} not found")
 
         except websockets.ConnectionClosed:
             print(f"⚠️  Connection closed, reconnecting in {backoff:.0f}s...")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, RECONNECT_MAX)
+            reconnect_with_backoff = True
         finally:
+            # 当前协议中 backend 会将断连任务收为 cancelled；同步取消所有绑定
+            # 本连接的任务并 killpg，不能留下手机看不见的电脑进程。
+            for task in tuple(connection_tasks):
+                task.cancel()
+            if connection_tasks:
+                await asyncio.gather(*connection_tasks, return_exceptions=True)
+            pending.clear()
             try:
                 await ws.close()
             except Exception:
                 pass
+        if reconnect_with_backoff:
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_MAX)
 
 
 async def handle_exec(ws, msg: dict, pending: dict, default_dir: str):
@@ -382,49 +596,50 @@ async def handle_exec(ws, msg: dict, pending: dict, default_dir: str):
         await send_output(ws, exec_id, f"🚫 命令已禁止: {instruction.split()[0]}\n", done=True, exit_code=126)
         return
 
-    if level == "confirm":
-        # 1. 向手机发送确认请求
-        await ws.send(json.dumps({
-            "type":        "agent_confirm_request",
-            "exec_id":     exec_id,
-            "agent_id":    agent_id,
-            "cmd_type":    cmd_type,
-            "instruction": instruction,
-            # 手机端弹窗自带「将要在 Mac 上执行以下指令」标题 → prompt 只放裸指令,不再前缀
-            # 「将要执行:」(避免弹窗里重复)。Mac 原生弹窗(下方)是独立语境,保留前缀。
-            "prompt":      instruction,
-        }, ensure_ascii=False))
-
-        # 2. 同时在 Mac 弹窗（asyncio 线程池执行阻塞调用）
-        event  = asyncio.Event()
-        result = {"approved": False}
-        pending[exec_id] = (event, result)
-
-        loop = asyncio.get_event_loop()
-        mac_approved = await loop.run_in_executor(
-            None, macos_dialog, "知己 · 远程指令", f"将要执行:\n{instruction}"
+    reservation_key = local_reservation_key(exec_id)
+    if not reserve_exec(reservation_key):
+        await send_output(
+            ws, exec_id, "并发任务过多，请等待已有任务结束\n",
+            done=True, exit_code=75, error="too_many_inflight",
         )
+        return
 
-        # 哪边先确认都行：Mac 弹窗 or 手机端
-        if mac_approved:
-            result["approved"] = True
-            event.set()
-        else:
-            # 等待手机端回复（最多 60s）
+    try:
+        if level == "confirm":
+            event  = asyncio.Event()
+            result = {"approved": False}
+            # 先注册 pending 再发手机帧，避免极速响应抢在 map 写入前成为 orphan。
+            pending[exec_id] = (event, result)
             try:
-                await asyncio.wait_for(event.wait(), timeout=60)
-            except asyncio.TimeoutError:
-                pass
+                await ws.send(json.dumps({
+                    "type":        "agent_confirm_request",
+                    "exec_id":     exec_id,
+                    "agent_id":    agent_id,
+                    "cmd_type":    cmd_type,
+                    "instruction": instruction,
+                    "prompt":      instruction,
+                }, ensure_ascii=False))
+                mac_future = asyncio.create_task(
+                    macos_dialog_async(
+                        "知己 · 远程指令", f"将要执行:\n{instruction}"
+                    )
+                )
+                approved = await wait_for_confirmation(mac_future, event, result)
+            finally:
+                pending.pop(exec_id, None)
 
-        pending.pop(exec_id, None)
+            if not approved:
+                print(f"❌  Rejected: {instruction[:60]}")
+                await send_output(ws, exec_id, "❌ 已拒绝执行\n", done=True, exit_code=130)
+                return
 
-        if not result["approved"]:
-            print(f"❌  Rejected: {instruction[:60]}")
-            await send_output(ws, exec_id, "❌ 已拒绝执行\n", done=True, exit_code=130)
-            return
-
-    print(f"▶️   Executing: {instruction[:60]}")
-    await execute(ws, exec_id, cmd_type, instruction, working_dir)
+        print(f"▶️   Executing: {instruction[:60]}")
+        await execute(
+            ws, exec_id, cmd_type, instruction, working_dir,
+            reservation_held=True,
+        )
+    finally:
+        EXEC_RESERVATIONS.discard(reservation_key)
 
 
 # ── Token 缓存 ────────────────────────────────────────────
@@ -502,6 +717,8 @@ def default_device_name() -> str:
 def main():
     parser = argparse.ArgumentParser(description="keni Mac Agent")
     parser.add_argument("--pair",     help="一次性配对码（在 keni APP → 远程控制 里生成，6 位字母数字）")
+    parser.add_argument("--pair-only", action="store_true",
+                        help="只兑换并缓存配对 token，不启动常驻 WebSocket")
     parser.add_argument("--email",    help="账号邮箱（旧登录方式，建议改用 --pair）")
     parser.add_argument("--password", help="账号密码（旧登录方式，建议改用 --pair）")
     parser.add_argument("--token",    help="直接指定 JWT token（可选，优先级最高）")
@@ -523,6 +740,8 @@ def main():
         cache["backend"] = args.backend
         save_cache(cache)
         print("✅  配对成功，token 已缓存到 ~/.superapp_agent.json")
+        if args.pair_only:
+            return
     if not token and args.email and args.password:
         http_base = ws_to_http(args.backend).rsplit("/api/", 1)[0]
         print(f"🔑  登录中 ({args.email})...")
