@@ -32,21 +32,34 @@ fi
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 PY="$(command -v python3 || true)"
 if [[ -z "$PY" ]]; then
-  echo "❌  没找到 python3。先 brew bundle 装一下:"
-  echo "    cd $REPO_DIR && brew bundle"
+  echo "❌  没找到 python3。"
+  echo "    macOS 自带的 python3 由「命令行开发者工具」提供,先装它:"
+  echo "        xcode-select --install"
+  echo "    会弹一个系统安装框,点「安装」等它装完,再回来重跑一次这条命令。"
   exit 1
 fi
 
-echo "📦  pip install -r requirements.txt ..."
-"$PY" -m pip install --user -r "$REPO_DIR/requirements.txt" >/dev/null
+echo "📦  [1/3] 装 Python 依赖 —— 首次要从 pypi.org 下载,慢的话是在等网络..."
+PIP_LOG="$(mktemp -t keni-agent-pip)"
+if ! "$PY" -m pip install --user -r "$REPO_DIR/requirements.txt" >"$PIP_LOG" 2>&1; then
+  echo "❌  依赖安装失败。下面是 pip 的完整输出:"
+  echo "──────────────────────────────────────────────"
+  cat "$PIP_LOG"
+  echo "──────────────────────────────────────────────"
+  rm -f "$PIP_LOG"
+  exit 1
+fi
+rm -f "$PIP_LOG"
+echo "✅  依赖就绪"
 
 # 配对(可选)—— 先跑一次 keni_agent.py --pair 把 token 缓存到 ~/.superapp_agent.json
 if [[ -n "$PAIR" ]]; then
-  echo "🔑  正在使用一次性配对码换 token..."
-  "$PY" "$REPO_DIR/keni_agent.py" --pair "$PAIR" --pair-only --backend "$BACKEND"
+  echo "🔑  [2/3] 正在用一次性配对码换 token..."
+  "$PY" -u "$REPO_DIR/keni_agent.py" --pair "$PAIR" --pair-only --backend "$BACKEND"
 fi
 
 # 写 LaunchAgent plist —— 用 sed 把模板里的 {{ }} 替换掉
+echo "🚀  [3/3] 注册开机自启服务..."
 LABEL="com.keni.agent"
 PLIST_SRC="$REPO_DIR/com.keni.agent.plist.template"
 PLIST_DST="$HOME/Library/LaunchAgents/${LABEL}.plist"

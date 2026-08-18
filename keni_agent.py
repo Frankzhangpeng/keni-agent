@@ -491,7 +491,7 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
             code = getattr(getattr(e, "response", None), "status_code", None)
             if code in (401, 403, 429):
                 print(f"❌  服务端拒绝连接 (HTTP {code}) —— token 失效 / 被吊销 / 被限流,重连无效。")
-                print(f"    请重新配对后再启动:python3 keni_agent.py --pair <新6位码> --backend {backend_url}")
+                print(f"    请重新配对后再启动:{repair_command(backend_url, '你在 APP 里的新码')}")
                 print("    已停止自动重连(干净退出,launchd 不再拉起)。")
                 sys.exit(0)
             print(f"⚠️  服务端拒绝 (HTTP {code}),{backoff:.0f}s 后重试...")
@@ -678,7 +678,7 @@ def login(http_base: str, email: str, password: str) -> str:
         sys.exit(1)
 
 
-def redeem_pair_code(http_base: str, code: str) -> str:
+def redeem_pair_code(http_base: str, code: str, backend_ws: str = "") -> str:
     """用一次性配对码（在 keni APP 里生成）换 JWT。
     免去在 Mac 上输入邮箱密码——配对码 5 分钟有效，单次使用。"""
     url = f"{http_base}/api/v1/agent/pair/redeem"
@@ -694,11 +694,25 @@ def redeem_pair_code(http_base: str, code: str) -> str:
                 sys.exit(1)
             return token
     except urllib.error.HTTPError as e:
-        _print_redeem_error(e)
+        _print_redeem_error(e, backend_ws)
         sys.exit(1)
     except Exception as e:
         print(f"❌  配对请求失败: {e}")
         sys.exit(1)
+
+
+def repair_command(backend_ws: str, code_hint: str) -> str:
+    """拼一条能直接粘贴执行的续配对命令。
+
+    必须带 --backend:cache["backend"] 全文件只有写入点、没有任何读回点,
+    省掉它就会 fallback 到 argparse 默认的 ws://localhost:8080/...,在用户
+    机器上必然连不上。
+    码位置一律给占位符、不回显真码:这行字是用户最可能整段贴进群聊或贴给
+    AI 的东西。
+    """
+    script = os.path.abspath(__file__)
+    target = backend_ws or "<你的 WS URL>"
+    return f"python3 {script} --pair <{code_hint}> --backend {target}"
 
 
 def _redeem_retry_after(e, body):
@@ -719,7 +733,7 @@ def _redeem_retry_after(e, body):
     return None
 
 
-def _print_redeem_error(e):
+def _print_redeem_error(e, backend_ws: str = ""):
     """按 HTTP 状态码 + error 码分档说明配对失败原因。
 
     这几类失败的正确补救动作互不相同，压成同一句“配对码无效或已过期，请重新生成”
@@ -739,22 +753,27 @@ def _print_redeem_error(e):
         if err == "too_many_failed_attempts":
             # 后端只在“码查无”时累计这个计数器 ⇒ 这个码本身确实无效/过期。
             print(f"❌  连续多次配对失败，已被限流：{when}。")
-            print("    这个码是无效或已过期的，重试前请在 keni APP 里 → 远程控制 → 重新生成配对码")
+            print("    这个码是无效或已过期的，重试前请在 keni APP 里 → 远程控制 → 换一个新码")
+            print(f"    然后跑：{repair_command(backend_ws, '你在 APP 里的新码')}")
         else:
             # 入口限流：拦在校验之前，这个码未必有问题，别去烧生成配额。
             print(f"❌  请求过于频繁，已被限流：{when}。")
             print("    你的配对码可能仍然有效（有效期 5 分钟），请先直接重试，不要重新生成")
+            print(f"    重试跑：{repair_command(backend_ws, '你刚才那个码')}")
         return
     if code is not None and code >= 500:
         print(f"❌  服务暂时不可用（HTTP {code}：{err}）。")
         print("    你的配对码还没有被消耗，请稍后用同一个码重试")
+        print(f"    重试跑：{repair_command(backend_ws, '你刚才那个码')}")
         return
     if code == 400:
         print(f"❌  配对码格式不正确：{err}")
         print("    码是 6 位字母数字，请核对后重新输入")
+        print(f"    重新跑：{repair_command(backend_ws, '你的 6 位码')}")
         return
     print(f"❌  配对码无效或已过期：{err}")
-    print("    请在 keni APP 里 → 远程控制 → 重新生成配对码")
+    print("    请在 keni APP 里 → 远程控制 → 换一个新码")
+    print(f"    然后跑：{repair_command(backend_ws, '你在 APP 里的新码')}")
 
 def ws_to_http(ws_url: str) -> str:
     """把 ws:// 转成 http://，wss:// 转成 https://"""
@@ -785,8 +804,8 @@ def main():
     token = args.token or ""
     if not token and args.pair:
         http_base = ws_to_http(args.backend).rsplit("/api/", 1)[0]
-        print(f"🔑  使用配对码登录 ({args.pair.upper()})...")
-        token = redeem_pair_code(http_base, args.pair)
+        print("🔑  正在用一次性配对码换 token...")
+        token = redeem_pair_code(http_base, args.pair, args.backend)
         cache["token"] = token
         cache["backend"] = args.backend
         save_cache(cache)
@@ -806,7 +825,7 @@ def main():
     if not token:
         print("❌  未找到 token。请用一次性配对码登录：")
         print("    1) 打开 keni APP → 远程控制 → 生成配对码")
-        print("    2) python3 keni_agent.py --pair 你的6位码 --backend <你的WS URL>")
+        print(f"    2) {repair_command(args.backend, '你在 APP 里的新码')}")
         sys.exit(1)
 
     device = args.device or cache.get("device") or default_device_name()
