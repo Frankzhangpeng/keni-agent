@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import io
 import json
 import sys
 import types
@@ -187,6 +189,50 @@ class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         dialog.assert_not_called()
         self.assertEqual(ws.messages[-1]['error'], 'too_many_inflight')
         self.assertEqual(pending, {})
+
+
+class RedeemErrorMessageTests(unittest.TestCase):
+    """429 两档的补救动作互不相同，措辞不能混用。"""
+
+    @staticmethod
+    def _err(code, body, headers=None):
+        return types.SimpleNamespace(
+            code=code,
+            headers=headers or {},
+            read=lambda: json.dumps(body).encode(),
+        )
+
+    def _capture(self, e):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            agent._print_redeem_error(e, 'ws://example.test/api/v1/agent/ws')
+        return buf.getvalue()
+
+    def test_failed_attempts_branch_never_tells_user_to_wait(self):
+        # 后端在这一档不下发秒数；即便下发也不该照抄：该计数器只在“码查无”时累计，
+        # 等待不会让这个码变回有效，正确动作是回 APP 换新码。
+        for headers, body in (
+            ({}, {'error': 'too_many_failed_attempts'}),
+            ({'Retry-After': '3600'},
+             {'error': 'too_many_failed_attempts', 'retry_after': 3600}),
+        ):
+            with self.subTest(headers=headers):
+                out = self._capture(self._err(429, body, headers))
+                self.assertNotIn('重试', out)
+                self.assertNotIn('稍后', out)
+                self.assertNotIn('3600', out)
+                self.assertIn('换一个新码', out)
+
+    def test_entry_rate_limit_branch_still_consumes_retry_after(self):
+        # A 闸拦在校验之前，码可能仍有效 ⇒ 这一档的等待建议是对的，秒数要照常读。
+        out = self._capture(
+            self._err(429, {'error': 'rate_limited', 'retry_after': 42}))
+        self.assertIn('42 秒后重试', out)
+        self.assertIn('不要重新生成', out)
+
+    def test_entry_rate_limit_without_seconds_falls_back(self):
+        out = self._capture(self._err(429, {'error': 'rate_limited'}))
+        self.assertIn('请稍后重试', out)
 
 
 if __name__ == '__main__':

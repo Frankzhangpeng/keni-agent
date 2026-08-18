@@ -748,18 +748,23 @@ def _print_redeem_error(e, backend_ws: str = ""):
     code = getattr(e, "code", None)
 
     if code == 429:
+        if err == "too_many_failed_attempts":
+            # 这一档不给等待时长，也不说“稍后重试”：后端只在“码查无”分支累计这个
+            # 计数器 ⇒ 触发它说明这个码确实无效/过期（码 TTL 5 分钟），等多久它都不会
+            # 变回有效。而该计数器嵌在 UPDATE 之后的 ErrNoRows 分支内、不拦有效码，
+            # 所以换一个新码可以立刻重试，不必等这一小时的窗口过去。
+            # 后端因此也不再下发 Retry-After / retry_after（backend/handlers/agent_pair.go）。
+            print("❌  连续多次配对失败，已被限流。")
+            print("    这个码是无效或已过期的，请在 keni APP 里 → 远程控制 → 换一个新码")
+            print(f"    然后跑：{repair_command(backend_ws, '你在 APP 里的新码')}")
+            return
+        # 入口限流：拦在校验之前，这个码未必有问题，别去烧生成配额。
+        # 这一档的“等 N 秒再试”是对的建议，所以照常消费 retry_after。
         wait = _redeem_retry_after(e, body)
         when = f"请 {wait} 秒后重试" if wait else "请稍后重试"
-        if err == "too_many_failed_attempts":
-            # 后端只在“码查无”时累计这个计数器 ⇒ 这个码本身确实无效/过期。
-            print(f"❌  连续多次配对失败，已被限流：{when}。")
-            print("    这个码是无效或已过期的，重试前请在 keni APP 里 → 远程控制 → 换一个新码")
-            print(f"    然后跑：{repair_command(backend_ws, '你在 APP 里的新码')}")
-        else:
-            # 入口限流：拦在校验之前，这个码未必有问题，别去烧生成配额。
-            print(f"❌  请求过于频繁，已被限流：{when}。")
-            print("    你的配对码可能仍然有效（有效期 5 分钟），请先直接重试，不要重新生成")
-            print(f"    重试跑：{repair_command(backend_ws, '你刚才那个码')}")
+        print(f"❌  请求过于频繁，已被限流：{when}。")
+        print("    你的配对码可能仍然有效（有效期 5 分钟），请先直接重试，不要重新生成")
+        print(f"    重试跑：{repair_command(backend_ws, '你刚才那个码')}")
         return
     if code is not None and code >= 500:
         print(f"❌  服务暂时不可用（HTTP {code}：{err}）。")
