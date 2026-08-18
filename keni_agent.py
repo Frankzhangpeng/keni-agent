@@ -694,16 +694,67 @@ def redeem_pair_code(http_base: str, code: str) -> str:
                 sys.exit(1)
             return token
     except urllib.error.HTTPError as e:
-        try:
-            err = json.loads(e.read()).get("error", str(e))
-        except Exception:
-            err = str(e)
-        print(f"❌  配对码无效或已过期：{err}")
-        print("    请在 keni APP 里 → 远程控制 → 重新生成配对码")
+        _print_redeem_error(e)
         sys.exit(1)
     except Exception as e:
         print(f"❌  配对请求失败: {e}")
         sys.exit(1)
+
+
+def _redeem_retry_after(e, body):
+    """429 的等待秒数：优先 Retry-After 头（HTTP 标准位），缺失回退 body.retry_after。
+
+    后端在限流器走本地兜底（Redis 不可达）时**不下发**这两个值——那种情况下它拿到的
+    只是整个窗口的保守上界、不是真实剩余。取不到就返回 None，由调用方说“稍后重试”，
+    不编一个数字出来。
+    """
+    for v in (e.headers.get("Retry-After") if e.headers else None,
+              body.get("retry_after")):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return None
+
+
+def _print_redeem_error(e):
+    """按 HTTP 状态码 + error 码分档说明配对失败原因。
+
+    这几类失败的正确补救动作互不相同，压成同一句“配对码无效或已过期，请重新生成”
+    会把被限流和撞上服务故障的用户推去重新生成码——而生成那一侧另有 5 次/小时的
+    配额，等于拿一个几十秒的问题换一个一小时的问题。
+    """
+    try:
+        body = json.loads(e.read())
+    except Exception:
+        body = {}
+    err = body.get("error", str(e))
+    code = getattr(e, "code", None)
+
+    if code == 429:
+        wait = _redeem_retry_after(e, body)
+        when = f"请 {wait} 秒后重试" if wait else "请稍后重试"
+        if err == "too_many_failed_attempts":
+            # 后端只在“码查无”时累计这个计数器 ⇒ 这个码本身确实无效/过期。
+            print(f"❌  连续多次配对失败，已被限流：{when}。")
+            print("    这个码是无效或已过期的，重试前请在 keni APP 里 → 远程控制 → 重新生成配对码")
+        else:
+            # 入口限流：拦在校验之前，这个码未必有问题，别去烧生成配额。
+            print(f"❌  请求过于频繁，已被限流：{when}。")
+            print("    你的配对码可能仍然有效（有效期 5 分钟），请先直接重试，不要重新生成")
+        return
+    if code is not None and code >= 500:
+        print(f"❌  服务暂时不可用（HTTP {code}：{err}）。")
+        print("    你的配对码还没有被消耗，请稍后用同一个码重试")
+        return
+    if code == 400:
+        print(f"❌  配对码格式不正确：{err}")
+        print("    码是 6 位字母数字，请核对后重新输入")
+        return
+    print(f"❌  配对码无效或已过期：{err}")
+    print("    请在 keni APP 里 → 远程控制 → 重新生成配对码")
 
 def ws_to_http(ws_url: str) -> str:
     """把 ws:// 转成 http://，wss:// 转成 https://"""
