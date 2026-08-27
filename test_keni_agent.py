@@ -88,6 +88,17 @@ class AgentSecurityTests(unittest.TestCase):
              mock.patch.dict(agent.os.environ, {'KENI_SANDBOX': 'appcontainer'}):
             self.assertEqual(agent.detect_sandbox_runtime(), 'none')
 
+    def test_windows_catastrophic_commands_are_banned_locally(self):
+        with mock.patch.object(agent, 'agent_platform', return_value='windows'):
+            self.assertEqual(
+                agent.classify('shell', 'Remove-Item -Recurse -Force C:\\'),
+                'banned',
+            )
+            self.assertEqual(
+                agent.classify('shell', 'Get-ChildItem C:\\Users'),
+                'safe',
+            )
+
     def test_linux_prefers_nsjail_then_firejail(self):
         with mock.patch.object(agent, 'agent_platform', return_value='linux'), \
              mock.patch.dict(agent.os.environ, {}, clear=True), \

@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import signal
@@ -179,6 +180,15 @@ BANNED_COMMANDS = {
     "restart-computer",
 }
 
+WINDOWS_BANNED_PATTERNS = [
+    re.compile(r"(?i)\b(remove-item|del|erase|rd|rmdir)\b.*(-recurse|/s\b).*[a-z]:\\(?:\s|$)"),
+    re.compile(r"(?i)\b(format-volume|clear-disk|initialize-disk|remove-partition)\b"),
+    re.compile(r"(?i)\bstart-process\b.*-verb\s+runas\b"),
+    re.compile(r"(?i)\b(powershell|pwsh)(\.exe)?\b.*-(encodedcommand|enc)\b"),
+    re.compile(r"(?i)(^|[\s;|&(])(invoke-expression|iex)\b"),
+    re.compile(r"(?i)\b(schtasks(\.exe)?\s+/create|new-service\b|sc(\.exe)?\s+create\b)"),
+]
+
 
 # ── NL Provider 注册表 ─────────────────────────────────────
 # 手机端 cmd_type 来这里查 → 拼实际 argv。新增 LLM CLI 在这里加一行即可。
@@ -214,6 +224,11 @@ def classify(cmd_type: str, instruction: str) -> str:
     """返回 'safe' | 'confirm' | 'banned'"""
     if cmd_type in PROVIDERS:
         return PROVIDERS[cmd_type]["level"]
+
+    if agent_platform() == "windows" and any(
+        pattern.search(instruction) for pattern in WINDOWS_BANNED_PATTERNS
+    ):
+        return "banned"
 
     parts = shlex.split(instruction, posix=os.name != "nt") if instruction.strip() else []
     if not parts:
