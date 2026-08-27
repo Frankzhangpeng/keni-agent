@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-keni Mac Agent — 手机远程控制 Mac 的本地守护脚本
+keni Desktop Agent — 手机远程控制 macOS / Windows / Linux 的本地守护脚本
 
 用法（首次）:
   python3 keni_agent.py --pair 你的6位码 --backend ws://你的服务器:8080/api/v1/agent/ws
@@ -15,9 +15,12 @@ keni Mac Agent — 手机远程控制 Mac 的本地守护脚本
 """
 
 import asyncio
+import base64
 import json
 import os
+import platform
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -29,10 +32,14 @@ import socket
 # ── 安装依赖 ──────────────────────────────────────────────
 try:
     import websockets
-except ImportError:
-    print("Installing websockets...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "websockets"], check=True)
-    import websockets
+except ImportError:  # pragma: no cover - installer creates a venv with this dependency
+    websockets = None
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+except ImportError:  # pragma: no cover - installer creates a venv with this dependency
+    serialization = None
+    Ed25519PrivateKey = None
 
 # ── 重连 / 心跳参数(可经环境变量外置覆盖,免改码调优)────────────────
 # 瞬时失败(网络抖动 / backend 重启 / 临时拒绝)指数退避重连:base 起步、×2 增长、封顶 max,
@@ -43,6 +50,99 @@ PING_INTERVAL = float(os.environ.get("KENI_PING_INTERVAL", "25"))    # ws 心跳
 PING_TIMEOUT = float(os.environ.get("KENI_PING_TIMEOUT", "15"))      # ws 心跳超时
 EXEC_PROGRESS_INTERVAL = float(os.environ.get("KENI_EXEC_PROGRESS_INTERVAL", "15"))
 MAX_ACTIVE_SESSIONS = 3
+AGENT_PROTOCOL_VERSION = "2"
+
+
+def agent_platform() -> str:
+    """Return the backend protocol OS token, never a display label."""
+    system = platform.system().lower()
+    return {
+        "darwin": "darwin",
+        "windows": "windows",
+        "linux": "linux",
+    }.get(system, system[:32] or "unknown")
+
+
+def agent_arch() -> str:
+    machine = platform.machine().lower()
+    return {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(machine, machine[:32] or "unknown")
+
+
+def detect_sandbox_runtime() -> str:
+    """Report only a sandbox that this process can actually use for child jobs."""
+    override = os.environ.get("KENI_SANDBOX", "").strip().lower()
+    current = agent_platform()
+    allowed = {
+        "darwin": {"sandbox-exec", "none"},
+        "linux": {"nsjail", "firejail", "none"},
+        "windows": {"none"},
+    }.get(current, {"none"})
+    if override:
+        return override if override in allowed else "none"
+    if current == "darwin" and shutil.which("sandbox-exec"):
+        return "sandbox-exec"
+    if current == "linux":
+        if shutil.which("nsjail"):
+            return "nsjail"
+        if shutil.which("firejail"):
+            return "firejail"
+    # Windows must remain fail-closed until a signed AppContainer launcher exists.
+    return "none"
+
+
+ACTIVE_SANDBOX_MODE = detect_sandbox_runtime()
+
+MACOS_SANDBOX_PROFILE = """
+(version 1)
+(deny default)
+(allow process-fork)
+(allow process-exec)
+(allow signal (target same-sandbox))
+(allow sysctl-read)
+(allow file-read*)
+(allow file-write* (subpath (param "USER_PROJECT_DIR")))
+(allow file-write* (subpath "/tmp"))
+(allow network*)
+""".strip()
+
+
+def sandboxed_command(cmd: list[str], working_dir: str) -> list[str]:
+    """Wrap one argv in the detected OS sandbox without interpolating user text."""
+    mode = ACTIVE_SANDBOX_MODE
+    if mode == "sandbox-exec":
+        return [
+            "sandbox-exec", "-p", MACOS_SANDBOX_PROFILE,
+            "-D", f"USER_PROJECT_DIR={working_dir}", "--", *cmd,
+        ]
+    if mode == "nsjail":
+        mounts = ["/usr", "/bin", "/etc"]
+        for candidate in ("/lib", "/lib64", "/sbin"):
+            if os.path.exists(candidate):
+                mounts.append(candidate)
+        prefix = [
+            "nsjail", "--mode", "o", "--quiet", "--time_limit", "1800",
+            "--rlimit_fsize", "524288000", "--disable_clone_newnet",
+            "--cwd", working_dir,
+        ]
+        for mount in mounts:
+            prefix.extend(["--bindmount_ro", mount])
+        prefix.extend(["--bindmount", working_dir, "--bindmount", "/tmp", "--"])
+        return [*prefix, *cmd]
+    if mode == "firejail":
+        prefix = [
+            "firejail", "--quiet", "--noprofile", "--private-tmp",
+            "--caps.drop=all", "--nonewprivs", f"--whitelist={working_dir}",
+        ]
+        for candidate in ("/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt"):
+            if os.path.exists(candidate):
+                prefix.append(f"--read-only={candidate}")
+        return [*prefix, "--", *cmd]
+    return cmd
 
 # ── 白名单 ─────────────────────────────────────────────────
 
@@ -54,6 +154,8 @@ SAFE_COMMANDS = {
     "flutter",  # flutter analyze / test
     "python3", "python", "node",
     "which", "env", "printenv", "df", "du", "ps",
+    "get-childitem", "get-content", "select-string", "get-location",
+    "get-process", "get-command", "write-output",
 }
 
 SAFE_GIT_SUBCMDS  = {"status", "log", "diff", "branch", "remote", "show", "stash", "fetch"}
@@ -66,10 +168,16 @@ CONFIRM_COMMANDS = {
     "curl", "wget",
     "kill", "pkill",
     "open",
+    "copy-item", "move-item", "new-item", "remove-item", "set-content",
+    "start-process", "stop-process", "invoke-webrequest", "curl.exe",
 }
 
 # 完全禁止
-BANNED_COMMANDS = {"sudo", "su", "bash", "sh", "zsh", "nc", "ncat"}
+BANNED_COMMANDS = {
+    "sudo", "su", "bash", "sh", "zsh", "nc", "ncat",
+    "format-volume", "clear-disk", "initialize-disk", "stop-computer",
+    "restart-computer",
+}
 
 
 # ── NL Provider 注册表 ─────────────────────────────────────
@@ -107,7 +215,7 @@ def classify(cmd_type: str, instruction: str) -> str:
     if cmd_type in PROVIDERS:
         return PROVIDERS[cmd_type]["level"]
 
-    parts = shlex.split(instruction) if instruction.strip() else []
+    parts = shlex.split(instruction, posix=os.name != "nt") if instruction.strip() else []
     if not parts:
         return "banned"
 
@@ -129,7 +237,7 @@ def classify(cmd_type: str, instruction: str) -> str:
     return "confirm"
 
 
-# ── macOS 原生确认弹窗 ──────────────────────────────────────
+# ── 本机原生确认弹窗 ────────────────────────────────────────
 
 MACOS_DIALOG_SCRIPT = """
 on run argv
@@ -177,10 +285,76 @@ async def macos_dialog_async(title: str, message: str) -> bool:
     return dialog_approved(stdout.decode("utf-8", errors="replace"), proc.returncode)
 
 
-async def wait_for_confirmation(mac_future, event, result, timeout=60) -> bool:
-    """Mac 与手机真正竞争；任一明确允许即继续，超时/双方拒绝均 fail closed。"""
+WINDOWS_DIALOG_SCRIPT = r"""
+Add-Type -AssemblyName PresentationFramework
+$choice = [System.Windows.MessageBox]::Show(
+  $env:KENI_DIALOG_MESSAGE,
+  $env:KENI_DIALOG_TITLE,
+  [System.Windows.MessageBoxButton]::YesNo,
+  [System.Windows.MessageBoxImage]::Warning,
+  [System.Windows.MessageBoxResult]::No
+)
+if ($choice -eq [System.Windows.MessageBoxResult]::Yes) { Write-Output 'APPROVED' }
+""".strip()
+
+
+async def windows_dialog_async(title: str, message: str) -> bool:
+    executable = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not executable:
+        return False
+    proc = await asyncio.create_subprocess_exec(
+        executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-STA",
+        "-Command", WINDOWS_DIALOG_SCRIPT,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "KENI_DIALOG_TITLE": title, "KENI_DIALOG_MESSAGE": message},
+    )
+    try:
+        stdout, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            proc.terminate()
+            await proc.wait()
+        raise
+    return proc.returncode == 0 and stdout.decode(errors="replace").strip() == "APPROVED"
+
+
+async def linux_dialog_async(title: str, message: str) -> bool:
+    zenity = shutil.which("zenity")
+    kdialog = shutil.which("kdialog")
+    if zenity:
+        argv = [zenity, "--question", f"--title={title}", f"--text={message}", "--timeout=60"]
+    elif kdialog:
+        argv = [kdialog, "--title", title, "--warningyesno", message]
+    else:
+        return False
+    proc = await asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        return await proc.wait() == 0
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            proc.terminate()
+            await proc.wait()
+        raise
+
+
+async def local_dialog_async(title: str, message: str) -> bool:
+    current = agent_platform()
+    if current == "darwin":
+        return await macos_dialog_async(title, message)
+    if current == "windows":
+        return await windows_dialog_async(title, message)
+    if current == "linux":
+        return await linux_dialog_async(title, message)
+    return False
+
+
+async def wait_for_confirmation(local_future, event, result, timeout=60) -> bool:
+    """Desktop and phone race; either explicit approval wins, otherwise fail closed."""
     phone_task = asyncio.create_task(event.wait())
-    waiting = {mac_future, phone_task}
+    waiting = {local_future, phone_task}
     deadline = asyncio.get_running_loop().time() + timeout
     try:
         while waiting:
@@ -192,9 +366,9 @@ async def wait_for_confirmation(mac_future, event, result, timeout=60) -> bool:
             )
             if not done:
                 return False
-            if mac_future in done:
-                waiting.remove(mac_future)
-                if mac_future.result() is True:
+            if local_future in done:
+                waiting.remove(local_future)
+                if local_future.result() is True:
                     return True
             if phone_task in done:
                 waiting.remove(phone_task)
@@ -203,9 +377,9 @@ async def wait_for_confirmation(mac_future, event, result, timeout=60) -> bool:
         return False
     finally:
         phone_task.cancel()
-        if not mac_future.done():
-            mac_future.cancel()
-        await asyncio.gather(phone_task, mac_future, return_exceptions=True)
+        if not local_future.done():
+            local_future.cancel()
+        await asyncio.gather(phone_task, local_future, return_exceptions=True)
 
 
 # ── 命令执行（流式输出）─────────────────────────────────────
@@ -252,6 +426,68 @@ def local_reservation_key(exec_id: str) -> str:
 
 # 由 agent_registered 帧从 backend 拿到；上报会话时附在帧里，方便手机端归属
 SELF_AGENT_ID: str = ""
+SELF_CONN_ID: str = ""
+AGENT_PRIVATE_KEY = None
+AGENT_PUBLIC_KEY_B64: str = ""
+
+
+def raw_b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii").rstrip("=")
+
+
+def raw_b64decode(value: str) -> bytes:
+    return base64.b64decode(value + "=" * (-len(value) % 4))
+
+
+def ensure_agent_identity_key(cache: dict):
+    """Create one persistent Ed25519 key for WS challenge responses."""
+    global AGENT_PRIVATE_KEY, AGENT_PUBLIC_KEY_B64
+    if Ed25519PrivateKey is None or serialization is None:
+        raise RuntimeError("cryptography is missing; reinstall keni-agent")
+    encoded = str(cache.get("ed25519_private_key") or "")
+    try:
+        private = Ed25519PrivateKey.from_private_bytes(raw_b64decode(encoded))
+    except Exception:
+        private = Ed25519PrivateKey.generate()
+        private_raw = private.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        cache["ed25519_private_key"] = raw_b64(private_raw)
+        save_cache(cache)
+    public_raw = private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    AGENT_PRIVATE_KEY = private
+    AGENT_PUBLIC_KEY_B64 = raw_b64(public_raw)
+    return private
+
+
+def build_attest_message(
+    nonce: str, agent_id: str, conn_id: str, sandbox_mode: str, ts_agent: int,
+) -> bytes:
+    fields = ["v1", nonce, agent_id, conn_id, sandbox_mode, str(ts_agent)]
+    return b"\x00".join(field.encode("utf-8") for field in fields)
+
+
+async def answer_attest_challenge(ws, msg: dict):
+    nonce = str(msg.get("nonce") or "")
+    if not nonce or not SELF_AGENT_ID or not SELF_CONN_ID or AGENT_PRIVATE_KEY is None:
+        return
+    ts_agent = int(_time.time())
+    payload = build_attest_message(
+        nonce, SELF_AGENT_ID, SELF_CONN_ID, ACTIVE_SANDBOX_MODE, ts_agent,
+    )
+    signature = AGENT_PRIVATE_KEY.sign(payload)
+    await ws.send(json.dumps({
+        "type": "agent_attest_response",
+        "nonce": nonce,
+        "sig": raw_b64(signature),
+        "sandbox_mode": ACTIVE_SANDBOX_MODE,
+        "ts_agent": ts_agent,
+    }))
 
 
 async def broadcast_sessions(ws):
@@ -300,7 +536,12 @@ def terminate_process_tree(proc, pgid=None) -> bool:
         else:
             if proc.returncode is not None:
                 return False
-            proc.terminate()
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
         return True
     except (ProcessLookupError, OSError):
         return False
@@ -334,8 +575,12 @@ async def reap_process_tree(proc, pgid=None, grace: float = 5.0):
         except (ProcessLookupError, OSError):
             pass
     elif proc is not None and proc.returncode is None:
-        proc.kill()
-        await proc.wait()
+        terminate_process_tree(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
 
 
 async def execute(
@@ -354,8 +599,9 @@ async def execute(
         await send_output(ws, exec_id, f"命令解析失败: {e}\n", done=True, exit_code=1)
         return
 
+    working_dir = os.path.abspath(os.path.expanduser(working_dir))
     if not os.path.isdir(working_dir):
-        working_dir = os.path.expanduser("~")
+        working_dir = os.path.dirname(os.path.abspath(__file__))
 
     acquired_here = False
     reservation_key = exec_id
@@ -376,25 +622,39 @@ async def execute(
 
     progress_task = None
     try:
+        if cmd_type in PROVIDERS:
+            launch_cmd = cmd
+        elif agent_platform() == "windows":
+            powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+            if not powershell:
+                raise FileNotFoundError("powershell.exe")
+            launch_cmd = [
+                powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+                "-Command", instruction,
+            ]
+        else:
+            launch_cmd = ["/bin/sh", "-c", instruction]
+        launch_cmd = sandboxed_command(launch_cmd, working_dir)
+
         proc_kwargs = dict(
             stdin=asyncio.subprocess.PIPE if use_stdin else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=working_dir,
             env={**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1"},
-            start_new_session=(os.name == "posix"),
         )
-        if cmd_type in PROVIDERS:
-            # NL provider(claude_code 等):provider build 已构好 argv,直执行。
-            proc = await asyncio.create_subprocess_exec(*cmd, **proc_kwargs)
+        if os.name == "posix":
+            proc_kwargs["start_new_session"] = True
         else:
-            # shell 模式:走 /bin/sh -c,让 && | > ; 等 shell 操作符生效。此前 shlex.split +
-            # exec 把 `a && b` 拆成 argv 传给首程序(sw_vers 收到 -a 报错 / 标签当程序找不到)。
-            # 安全边界不变:仍受后端 allow_shell 闸 + 危险命令黑名单 + 用户确认三重约束。
-            proc = await asyncio.create_subprocess_shell(instruction, **proc_kwargs)
+            proc_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # Always use argv execution. Shell semantics live only in the explicit
+        # /bin/sh or PowerShell argv above, so user text never becomes a launcher argument.
+        proc = await asyncio.create_subprocess_exec(*launch_cmd, **proc_kwargs)
         sess.proc = proc
         if os.name == "posix":
             sess.pgid = os.getpgid(proc.pid)
+        else:
+            sess.pgid = proc.pid
         progress_task = asyncio.create_task(progress_heartbeat(ws, exec_id))
 
         if use_stdin and proc.stdin is not None:
@@ -427,7 +687,7 @@ async def execute(
         await reap_process_tree(sess.proc, sess.pgid)
         raise
     except FileNotFoundError:
-        cmd_name = cmd[0] if cmd else instruction
+        cmd_name = launch_cmd[0] if 'launch_cmd' in locals() and launch_cmd else (cmd[0] if cmd else instruction)
         await send_output(ws, exec_id, f"命令未找到: {cmd_name}\n", done=True, exit_code=127)
     except Exception as e:
         # 传输失败也必须先收进程树；不能再向同一个坏 ws 发送失败信息后丢掉句柄。
@@ -473,7 +733,16 @@ async def send_output(
 # ── 主 Agent 循环 ──────────────────────────────────────────
 
 async def run(backend_url: str, token: str, device_name: str, default_dir: str):
-    uri = f"{backend_url}?token={token}&device_name={device_name}"
+    query = urllib.parse.urlencode({
+        "token": token,
+        "device_name": device_name,
+        "sandbox": ACTIVE_SANDBOX_MODE,
+        "proto_version": AGENT_PROTOCOL_VERSION,
+        "os": agent_platform(),
+        "arch": agent_arch(),
+        "pubkey": AGENT_PUBLIC_KEY_B64,
+    })
+    uri = f"{backend_url}{'&' if '?' in backend_url else '?'}{query}"
     # exec_id → asyncio.Event + result dict（用于等待手机确认回复）
     pending: dict[str, tuple[asyncio.Event, dict]] = {}
 
@@ -518,9 +787,13 @@ async def run(backend_url: str, token: str, device_name: str, default_dir: str):
 
                 # ── 注册确认 ────────────────────────────────
                 if t == "agent_registered":
-                    global SELF_AGENT_ID
+                    global SELF_AGENT_ID, SELF_CONN_ID
                     SELF_AGENT_ID = msg.get("agent_id", "") or ""
+                    SELF_CONN_ID = msg.get("conn_id", "") or ""
                     print(f"🆔  Agent ID : {SELF_AGENT_ID}")
+
+                elif t == "agent_attest_challenge":
+                    await answer_attest_challenge(ws, msg)
 
                 # ── 断开指令 ────────────────────────────────
                 elif t == "agent_disconnect":
@@ -595,6 +868,13 @@ async def handle_exec(ws, msg: dict, pending: dict, default_dir: str):
     if level == "banned":
         await send_output(ws, exec_id, f"🚫 命令已禁止: {instruction.split()[0]}\n", done=True, exit_code=126)
         return
+    if cmd_type in PROVIDERS and ACTIVE_SANDBOX_MODE == "none":
+        await send_output(
+            ws, exec_id,
+            "🚫 当前系统没有可验证的命令沙箱，自然语言代理保持关闭；Shell 远控仍可使用。\n",
+            done=True, exit_code=126, error="sandbox_required_for_nl",
+        )
+        return
 
     reservation_key = local_reservation_key(exec_id)
     if not reserve_exec(reservation_key):
@@ -619,12 +899,12 @@ async def handle_exec(ws, msg: dict, pending: dict, default_dir: str):
                     "instruction": instruction,
                     "prompt":      instruction,
                 }, ensure_ascii=False))
-                mac_future = asyncio.create_task(
-                    macos_dialog_async(
+                local_future = asyncio.create_task(
+                    local_dialog_async(
                         "知己 · 远程指令", f"将要执行:\n{instruction}"
                     )
                 )
-                approved = await wait_for_confirmation(mac_future, event, result)
+                approved = await wait_for_confirmation(local_future, event, result)
             finally:
                 pending.pop(exec_id, None)
 
@@ -655,9 +935,18 @@ def load_cache() -> dict:
         return {}
 
 def save_cache(data: dict):
-    with open(CACHE_FILE, "w") as f:
+    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+    temp_file = f"{CACHE_FILE}.tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
         json.dump(data, f)
-    os.chmod(CACHE_FILE, 0o600)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_file, CACHE_FILE)
+    try:
+        os.chmod(CACHE_FILE, 0o600)
+    except OSError:
+        # Windows ACLs are inherited from the user's profile; chmod is best-effort there.
+        pass
 
 def login(http_base: str, email: str, password: str) -> str:
     """调用后端登录接口，返回 JWT token"""
@@ -715,7 +1004,10 @@ def default_device_name() -> str:
 # ── 入口 ──────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="keni Mac Agent")
+    if websockets is None or Ed25519PrivateKey is None:
+        print("❌  缺少运行依赖。请重新运行 install.sh / install.ps1。")
+        sys.exit(1)
+    parser = argparse.ArgumentParser(description="keni Desktop Agent")
     parser.add_argument("--pair",     help="一次性配对码（在 keni APP → 远程控制 里生成，6 位字母数字）")
     parser.add_argument("--pair-only", action="store_true",
                         help="只兑换并缓存配对 token，不启动常驻 WebSocket")
@@ -725,7 +1017,10 @@ def main():
     parser.add_argument("--device",   default=None, help="设备显示名称（默认取主机名）")
     parser.add_argument("--backend",  default=os.environ.get("KENI_BACKEND_URL", "ws://localhost:8080/api/v1/agent/ws"),
                         help="WS backend URL,默认读 KENI_BACKEND_URL 环境变量,再不行 fallback localhost")
-    parser.add_argument("--dir",      default=os.getcwd(), help="默认工作目录")
+    parser.add_argument(
+        "--dir", default=os.path.dirname(os.path.abspath(__file__)),
+        help="默认工作目录（未指定时仅限 agent 安装目录）",
+    )
     args = parser.parse_args()
 
     cache = load_cache()
@@ -761,11 +1056,12 @@ def main():
     device = args.device or cache.get("device") or default_device_name()
     cache["device"] = device
     save_cache(cache)
+    ensure_agent_identity_key(cache)
 
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
     try:
-        asyncio.run(run(args.backend, token, device, args.dir))
+        asyncio.run(run(args.backend, token, device, os.path.abspath(os.path.expanduser(args.dir))))
     except (KeyboardInterrupt, SystemExit):
         print("\n👋  Agent stopped")
 

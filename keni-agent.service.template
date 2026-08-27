@@ -1,0 +1,16 @@
+[Unit]
+Description=KENI remote control agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart="{{RUNNER}}"
+WorkingDirectory="{{WORKDIR}}"
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=8
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
