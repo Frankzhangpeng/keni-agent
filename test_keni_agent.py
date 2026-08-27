@@ -33,8 +33,11 @@ class FakeProc:
 
 
 class FakeStdout:
+    def __init__(self):
+        self._chunks = [b'working\n', b'']
+
     async def read(self, _):
-        return b'working\n'
+        return self._chunks.pop(0)
 
 
 class FailingWS(FakeWS):
@@ -73,6 +76,40 @@ class AgentSecurityTests(unittest.TestCase):
 
     def test_unknown_shell_still_requires_confirmation(self):
         self.assertEqual(agent.classify('shell', 'custom-tool --write'), 'confirm')
+
+    def test_platform_tokens_are_normalized_for_backend(self):
+        with mock.patch.object(agent.platform, 'system', return_value='Windows'), \
+             mock.patch.object(agent.platform, 'machine', return_value='AMD64'):
+            self.assertEqual(agent.agent_platform(), 'windows')
+            self.assertEqual(agent.agent_arch(), 'amd64')
+
+    def test_windows_never_claims_an_unimplemented_sandbox(self):
+        with mock.patch.object(agent, 'agent_platform', return_value='windows'), \
+             mock.patch.dict(agent.os.environ, {'KENI_SANDBOX': 'appcontainer'}):
+            self.assertEqual(agent.detect_sandbox_runtime(), 'none')
+
+    def test_windows_catastrophic_commands_are_banned_locally(self):
+        with mock.patch.object(agent, 'agent_platform', return_value='windows'):
+            self.assertEqual(
+                agent.classify('shell', 'Remove-Item -Recurse -Force C:\\'),
+                'banned',
+            )
+            self.assertEqual(
+                agent.classify('shell', 'Get-ChildItem C:\\Users'),
+                'safe',
+            )
+
+    def test_linux_prefers_nsjail_then_firejail(self):
+        with mock.patch.object(agent, 'agent_platform', return_value='linux'), \
+             mock.patch.dict(agent.os.environ, {}, clear=True), \
+             mock.patch.object(agent.shutil, 'which', side_effect=lambda name: '/usr/bin/nsjail' if name == 'nsjail' else None):
+            self.assertEqual(agent.detect_sandbox_runtime(), 'nsjail')
+
+    def test_attestation_message_matches_backend_canonical_format(self):
+        self.assertEqual(
+            agent.build_attest_message('nonce', 'agent', 'conn', 'firejail', 1720000000),
+            b'v1\x00nonce\x00agent\x00conn\x00firejail\x001720000000',
+        )
 
 
 class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -113,7 +150,7 @@ class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         proc = FakeProc()
         proc.stdout = FakeStdout()
         with mock.patch.object(
-            agent.asyncio, 'create_subprocess_shell', return_value=proc
+            agent.asyncio, 'create_subprocess_exec', return_value=proc
         ), mock.patch.object(agent.os, 'getpgid', return_value=4321), mock.patch.object(
             agent, 'reap_process_tree', new=mock.AsyncMock()
         ) as reap:

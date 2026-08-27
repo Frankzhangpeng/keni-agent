@@ -7,10 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>{{PYTHON}}</string>
-        <string>{{SCRIPT}}</string>
-        <string>--backend</string>
-        <string>{{BACKEND}}</string>
+        <string>{{RUNNER}}</string>
     </array>
 
     <key>RunAtLoad</key>

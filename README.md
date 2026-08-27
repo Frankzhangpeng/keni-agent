@@ -1,52 +1,47 @@
 # keni-agent
 
-手机远程控制 Mac 的本地守护脚本。配合 [keni APP](https://github.com/Frankzhangpeng/super) 使用 —— 手机端发命令(shell / Claude Code / OpenClaw / Codex / Cursor),Mac 端流式回输出。
+手机远程控制 macOS、Windows 与 Linux 桌面电脑的本地守护脚本。配合 [keni APP](https://github.com/Frankzhangpeng/super) 使用 —— 手机端发命令，电脑端流式回传输出。
 
 ## 它能干什么
 
 - **NL → 代码操作**:服务端安全开关启用对应 provider 后，手机可下发代码任务，Mac 上运行 CLI 并把结果流回手机
 - **多 LLM CLI 即插即用**:Claude / OpenClaw / Codex / Cursor 任选,APP 远控屏下拉切换
-- **安全闸**:破坏性命令(`rm` / `git push` / 任意 NL 提示)同时发起 Mac 与手机确认，任一端明确允许即可执行；`sudo` / `bash` 直接禁止
+- **安全闸**:破坏性命令同时发起电脑与手机确认，任一端明确允许即可执行；Windows/Linux/macOS 都使用原生确认界面
 - **多会话并发**:手机可以同时跑多条命令,逐条 kill
 - **Soul Memory 注入**:NL 命令自动带上后端记忆("按我平时的习惯整理…"这种指代能理解)
+- **跨平台常驻**:macOS LaunchAgent、Linux systemd user service、Windows current-user Scheduled Task
+- **连接证明**:上报 OS/架构/沙箱能力，并用持久 Ed25519 密钥响应后端挑战
 
-## 安装
+## 从 APP 安装
 
-### 1. 装依赖
+APP 的“远程控制 → 添加桌面设备”会按所选平台生成固定到不可变 commit 的完整命令。安装器使用项目内 `.venv`，不会修改系统 Python 包。
 
-```bash
-git clone https://github.com/Frankzhangpeng/keni-agent.git ~/keni-agent
-cd ~/keni-agent
-brew bundle                                    # 装 python@3.12
-python3 -m pip install --user -r requirements.txt  # 装 websockets
-```
+### macOS / Linux
 
-### 2. 在 keni APP 生成配对码
-
-打开 APP → 远程控制 → "添加 Mac" → 复制 6 位码(5 分钟有效)。
-
-### 3. 配对 + 自启
+需要 Git、Python 3。Linux 需要 systemd user service；若缺少 `venv`，Debian/Ubuntu 安装 `python3-venv`。
 
 ```bash
-bash install.sh \
-  --backend ws://你的服务器:8080/api/v1/agent/ws \
-  --pair ABCXYZ
+bash install.sh --backend wss://你的服务器/api/v1/agent/ws --pair ABCXYZ
 ```
 
-完成后 agent 会:
-- 写入 `~/Library/LaunchAgents/com.keni.agent.plist`
-- 立即启动 + 开机自启 + 崩了自动重拉
-- 日志:`~/Library/Logs/keni-agent.{out,err}.log`
+### Windows 10 / 11
+
+只需要 Python 3；APP 生成的 PowerShell 命令会下载固定版本并调用：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 `
+  -Backend wss://你的服务器/api/v1/agent/ws -Pair ABCXYZ
+```
+
+Windows 以当前用户、Limited 权限注册计划任务，不要求管理员权限。日志位于 `%LOCALAPPDATA%\KENI\Logs\keni-agent.log`。
 
 ## 卸载
 
-```bash
-bash uninstall.sh
-```
+macOS/Linux：`bash uninstall.sh`。Windows：`powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1`。加 `--purge-token`（PowerShell 为 `-PurgeToken`）才会同时删除本地配对 token 与 Ed25519 私钥。
 
 ## 手动调试
 
-不想走 launchd,前台跑:
+不想走系统常驻服务时可前台运行：
 
 ```bash
 python3 keni_agent.py --backend ws://你的服务器:8080/api/v1/agent/ws
@@ -72,16 +67,18 @@ token 第一次配对后缓存在 `~/.superapp_agent.json`,后续直接跑就行
 
 super 仓库的 CI(`.github/workflows/check-agent-providers.yml`)会校验三处白名单一致。
 
-## 安全模型
+## 安全模型与平台差异
 
 | 命令类别       | 行为                                     |
 | -------------- | ---------------------------------------- |
 | safe(只读)   | 直接执行(`ls/cat/grep/git status...`) |
-| confirm        | Mac AppleScript + 手机 WS 并行确认，任一端允许即继续；双方拒绝或超时 abort |
+| confirm        | 桌面原生弹窗 + 手机 WS 并行确认，任一端允许即继续；双方拒绝或超时 abort |
 | banned         | 客户端不可触达(`sudo/su/bash/sh/zsh/nc`) |
 | NL provider    | 永远 confirm —— LLM 输出不可预测       |
 
 确认 60 秒内无任何回应 → 默认拒绝。
+
+macOS 使用 `sandbox-exec`，Linux 优先使用 `nsjail`、其次 `firejail`。如果 Linux 没有可用沙箱，Shell 仍可使用，但 NL provider 会在 agent 与后端两侧都 fail-closed。Windows 当前也只开放 Shell：仓库没有经过签名和设备证明的 AppContainer 启动器，因此 agent 会诚实上报 `sandbox=none`，绝不伪装成已沙箱化来点亮 NL provider。
 
 ## 协议(WS 帧)
 
